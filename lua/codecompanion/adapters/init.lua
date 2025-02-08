@@ -95,6 +95,7 @@ local Adapter = {}
 ---@field roles table The mapping of roles in the config to the LLM's defined roles
 ---@field features table The features that the adapter supports
 ---@field url string The URL of the generative AI service to connect to
+---@field _body? string The encoded body to send to the request
 ---@field env? table Environment variables which can be referenced in the parameters
 ---@field env_replaced? table Replacement of environment variables with their actual values
 ---@field headers table The headers to pass to the request
@@ -108,6 +109,7 @@ local Adapter = {}
 ---@field handlers.form_parameters fun(self: CodeCompanion.Adapter, params: table, messages: table): table
 ---@field handlers.form_messages fun(self: CodeCompanion.Adapter, messages: table): table
 ---@field handlers.tokens? fun(self: CodeCompanion.Adapter, data: table): number|nil
+---@field handlers.sign_request? fun(self: CodeCompanion.Adapter, payload: table, request_opts: table): table
 ---@field handlers.chat_output fun(self: CodeCompanion.Adapter, data: table): table|nil
 ---@field handlers.inline_output fun(self: CodeCompanion.Adapter, data: table, context: table): table|nil
 ---@field handlers.on_exit? fun(self: CodeCompanion.Adapter, data: table): table|nil

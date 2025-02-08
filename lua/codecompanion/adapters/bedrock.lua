@@ -77,45 +77,51 @@ return {
   },
   headers = {
     ["content-type"] = "application/json",
-    -- AWS auth headers will be added by the form_parameters handler
   },
   parameters = {
     stream = true,
   },
   opts = {
     stream = true,
+    method = "POST",
   },
   handlers = {
-    ---Set up AWS authentication before the request
+    --- Set up AWS authentication before the request
     ---@param self CodeCompanion.Adapter
     ---@return boolean
     setup = function(self)
       -- Initialize env_replaced if it doesn't exist
       self.env_replaced = self.env_replaced or {}
 
-      -- Get profile from env or env_replaced, fallback to "default" if empty
+      -- Determine profile: first check env_replaced, then env table, defaulting to "default"
       local profile = self.env_replaced.aws_profile or self.env.aws_profile
-      if profile == "" then
+      if not profile or profile == "" or type(profile) == "table" then
         profile = "default"
       end
       log:debug("Using AWS profile: %s", profile)
 
-      -- Try to get credentials from profile
+      local credentials = require("codecompanion.aws-sdk.core.credentials")
       local creds, err = read_aws_credentials(profile)
       if creds then
-        -- Store credentials for use in form_parameters
-        self.aws_credentials = creds
-        log:debug("Successfully loaded AWS credentials")
+        credentials.set(creds.aws_access_key_id, creds.aws_secret_access_key, creds.aws_session_token)
+        -- Store region for later use; if not specified in env, fall back to credentials if available.
+        self.region = creds.region or self.env.aws_region or "us-east-1"
+        log:debug("Successfully loaded AWS credentials from profile")
         return true
       end
 
       -- If profile credentials failed, try environment variables
-      if os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY") then
-        log:debug("Using AWS credentials from environment variables")
+      local access_key = os.getenv("AWS_ACCESS_KEY_ID")
+      local secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+      local session_token = os.getenv("AWS_SESSION_TOKEN")
+
+      if access_key and secret_key then
+        credentials.set(access_key, secret_key, session_token)
+        self.region = self.env.aws_region or "us-east-1"
+        log:debug("Successfully loaded AWS credentials from environment")
         return true
       end
 
-      -- No credentials found
       log:error(
         "AWS credentials not found in profile or environment variables: %s",
         err or "No environment variables set"
@@ -123,108 +129,67 @@ return {
       return false
     end,
 
-    ---Set the parameters and handle AWS authentication
+    --- Build the parameters for the request (without signing)
     ---@param self CodeCompanion.Adapter
     ---@param params table
     ---@param messages table
     ---@return table
     form_parameters = function(self, params, messages)
-      -- Initialize env_replaced if it doesn't exist
+      -- Initialize env_replaced if needed
       self.env_replaced = self.env_replaced or {}
 
-      -- Get region and ensure it's a string
-      local region = self.env_replaced.aws_region
-      if type(region) ~= "string" then
-        region = ""
-      end
+      -- Ensure required headers exist
+      self.headers = vim.tbl_deep_extend("force", {
+        ["content-type"] = "application/json",
+        ["accept"] = "application/json",
+      }, self.headers or {})
 
-      if region == "" then
-        -- Try to get region from profile
-        if self.aws_credentials and self.aws_credentials.region then
-          region = tostring(self.aws_credentials.region)
-        else
-          -- Default to us-east-1 if no region specified
-          region = "us-east-1"
-        end
+      -- Determine AWS region: prefer env_replaced, then env, then stored region
+      local region = self.env_replaced.aws_region or self.env.aws_region or self.region or "us-east-1"
+      if type(region) ~= "string" then
+        region = "us-east-1"
       end
       log:debug("Using AWS region: %s (type: %s)", region, type(region))
 
-      -- Get model ID from parameters or env
-      local model_id = self.parameters.model or self.env_replaced.model_id or "anthropic.claude-3-sonnet-20240229-v1:0"
-      log:debug("Using model ID: %s", model_id)
+      -- Determine model_id
+      local model_id = self.parameters.model
+        or self.env_replaced.model_id
+        or self.env.model_id
+        or "anthropic.claude-3-sonnet-20240229-v1:0"
+      -- URL encode the model id and normalize the region
+      model_id = aws.url_encode(model_id)
+      region = aws.url_encode(region:lower())
 
-      -- Replace variables directly and encode model ID for URL
-      -- Replace variables with escaped patterns for literals
-      local url = self.url:gsub("%${model_id}", model_id):gsub("%${region}", region)
-      log:debug("Constructed URL: %s", url)
+      -- Replace placeholders in the URL
+      self.url = self.url
+        :gsub("%$%{model_id%}", function()
+          return model_id
+        end)
+        :gsub("%$%{aws_region%}", function()
+          return region
+        end)
 
-      -- Get AWS credentials
-      local access_key, secret_key, session_token
-      if self.aws_credentials then
-        -- Use credentials from profile
-        access_key = self.aws_credentials.aws_access_key_id
-        secret_key = self.aws_credentials.aws_secret_access_key
-        session_token = self.aws_credentials.aws_session_token
-        log:debug("Using credentials from AWS profile")
-      else
-        -- Fallback to environment variables
-        access_key = os.getenv("AWS_ACCESS_KEY_ID")
-        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-        session_token = os.getenv("AWS_SESSION_TOKEN")
-        log:debug("Using credentials from environment variables")
-      end
-
-      if not access_key or not secret_key then
-        log:error("AWS credentials not found")
-        return params
-      end
-
-      -- Format messages first
+      -- Merge any extra parameters (if needed) and include headers.
       local formatted_params = self.handlers.form_messages(self, messages)
       if not formatted_params then
         log:error("Failed to format messages")
         return params
       end
 
-      -- Prepare request body
-      local body = vim.json.encode(formatted_params)
-      if not body then
-        log:error("Failed to encode request parameters")
-        return params
-      end
-
-      log:debug("Request body: %s", body)
-
-      -- Sign the request and get response
-      local headers = aws.sign_request(
-        "POST",
-        url,
-        region,
-        "bedrock",
-        self.headers,
-        body,
-        access_key,
-        secret_key,
-        session_token
-      )
-
-      -- Store the headers and URL for use in the request
-      self.headers = headers
-      self.url = url
-
-      -- Return the original params since we're handling the request in aws.lua
-      return params
+      return vim.tbl_extend("force", formatted_params, {
+        headers = self.headers, -- These will later be updated by sign_request.
+      })
     end,
 
-    ---Set the format of the role and content for the messages
+    --- Format the messages into the proper structure for the request body.
     ---@param self CodeCompanion.Adapter
     ---@param messages table
     ---@return table
     form_messages = function(self, messages)
-      -- Initialize env_replaced if it doesn't exist
+      -- Initialize env_replaced if needed
       self.env_replaced = self.env_replaced or {}
 
-      -- Extract and format system messages
+      -- Concatenate all system messages (if any)
       local system = vim
         .iter(messages)
         :filter(function(msg)
@@ -236,25 +201,34 @@ return {
         :totable()
       system = next(system) and table.concat(system, "\n") or nil
 
-      -- Remove system messages and merge user/assistant messages
-      messages = utils.merge_messages(vim
+      -- Filter out system messages and keep only user/assistant messages
+      local filtered_messages = vim
         .iter(messages)
         :filter(function(msg)
           return msg.role ~= "system"
         end)
-        :totable())
+        :totable()
 
-      -- Format based on model provider
+      -- For Claude models, only include user messages
+      if vim.startswith(self.env_replaced.model_id or "", "anthropic.claude") then
+        filtered_messages = vim
+          .iter(filtered_messages)
+          :filter(function(msg)
+            return msg.role == "user"
+          end)
+          :totable()
+      end
+
+      messages = utils.merge_messages(filtered_messages)
+
       local model_id = self.env_replaced.model_id or "anthropic.claude-3-sonnet-20240229-v1:0"
       if vim.startswith(model_id, "anthropic.claude") then
-        -- Format for Claude models
         return {
           anthropic_version = "bedrock-2023-05-31",
           messages = messages,
           system = system,
         }
       elseif vim.startswith(model_id, "amazon.titan") then
-        -- Format for Titan models
         return {
           inputText = system and (system .. "\n\n" .. messages[#messages].content) or messages[#messages].content,
           textGenerationConfig = {
@@ -270,7 +244,61 @@ return {
       end
     end,
 
-    ---Returns the number of tokens generated
+    --- AWS signing handler: updates request options with the Authorization header.
+    --- This handler is invoked in Client:request (after the body is written).
+    ---@param self CodeCompanion.Adapter
+    ---@param payload table The original payload (if needed)
+    ---@param request_opts table The current request options
+    ---@return table The updated request options with signed headers
+    sign_request = function(self, payload, request_opts)
+      local method = (self.opts and self.opts.method) or "POST"
+      local url = self:set_env_vars(self.url)
+      -- Replace any percent-encoded colon (%3A or %3a) with a literal colon
+      url = url:gsub("%%3[Aa]", ":")
+      -- Determine AWS region and ensure it is a string.
+      -- Determine AWS region and ensure it is a string.
+      local region = "us-east-1"
+
+      local credentials = require("codecompanion.aws-sdk.core.credentials")
+      local access_key, secret_key, session_token = credentials.get()
+      if not access_key or not secret_key then
+        log:error("AWS credentials not found in SDK during signing")
+        return request_opts
+      end
+
+      if not self._body then
+        log:error("Request body not found for AWS signing")
+        return request_opts
+      end
+
+      log:debug("Url used for signing: %s", url)
+      log:debug("Body used for signing: %s", self._body)
+      local signed_headers = aws.sign_request(
+        method,
+        url,
+        region,
+        "bedrock",
+        self.headers, -- base headers before signing
+        self._body, -- the JSON body string
+        access_key,
+        secret_key,
+        session_token
+      )
+
+      -- Debug log the signed headers to ensure Authorization is present.
+      log:debug("Signed headers returned: %s", vim.inspect(signed_headers))
+
+      if not signed_headers or not signed_headers.Authorization then
+        log:error("Failed to sign the request: no Authorization header produced")
+        return request_opts
+      end
+
+      request_opts.headers = vim.tbl_extend("force", request_opts.headers or {}, signed_headers)
+      log:debug("Final request headers: %s", vim.inspect(request_opts.headers))
+      return request_opts
+    end,
+
+    --- Return the number of tokens generated
     ---@param self CodeCompanion.Adapter
     ---@param data string
     ---@return number|nil
@@ -280,27 +308,23 @@ return {
         if ok then
           local model_id = self.env_replaced and self.env_replaced.model_id or "anthropic.claude-3-sonnet-20240229-v1:0"
           if vim.startswith(model_id, "anthropic.claude") then
-            -- Claude models provide token usage in message_start events
             if json.type == "message_start" then
-              input_tokens = (json.message.usage.input_tokens or 0)
+              input_tokens = json.message.usage.input_tokens or 0
               output_tokens = json.message.usage.output_tokens or 0
-            elseif json.type == "content_block_delta" then
+            elseif json.type == "content_block_delta" and json.usage then
               output_tokens = output_tokens + (json.usage.output_tokens or 0)
             end
             return input_tokens + output_tokens
           elseif vim.startswith(model_id, "amazon.titan") then
-            -- Titan models provide token usage in completion events
             if json.usage then
-              input_tokens = json.usage.input_tokens or input_tokens
-              output_tokens = json.usage.output_tokens or output_tokens
-              return input_tokens + output_tokens
+              return (json.usage.input_tokens or 0) + (json.usage.output_tokens or 0)
             end
           end
         end
       end
     end,
 
-    ---Output the data from the API ready for the chat buffer
+    --- Format API response for the chat buffer.
     ---@param self CodeCompanion.Adapter
     ---@param data string
     ---@return table|nil
@@ -312,7 +336,6 @@ return {
         if ok then
           local model_id = self.env_replaced and self.env_replaced.model_id or "anthropic.claude-3-sonnet-20240229-v1:0"
           if vim.startswith(model_id, "anthropic.claude") then
-            -- Parse Claude model response
             if json.type == "message" then
               output.role = "assistant"
               output.content = json.content
@@ -321,7 +344,6 @@ return {
               output.content = json.delta.text
             end
           elseif vim.startswith(model_id, "amazon.titan") then
-            -- Parse Titan model response
             if json.outputText then
               output.role = "assistant"
               output.content = json.outputText
@@ -339,7 +361,7 @@ return {
       end
     end,
 
-    ---Output the data from the API ready for inlining
+    --- Format API response for inlining.
     ---@param self CodeCompanion.Adapter
     ---@param data string
     ---@param context table
@@ -350,12 +372,10 @@ return {
         if ok then
           local model_id = self.env_replaced and self.env_replaced.model_id or "anthropic.claude-3-sonnet-20240229-v1:0"
           if vim.startswith(model_id, "anthropic.claude") then
-            -- Parse Claude model response
             if json.type == "content_block_delta" then
               return json.delta.text
             end
           elseif vim.startswith(model_id, "amazon.titan") then
-            -- Parse Titan model response
             if json.outputText then
               return json.outputText
             end
@@ -366,12 +386,12 @@ return {
       end
     end,
 
-    ---Handle errors and completion
+    --- Handle errors and completion.
     ---@param self CodeCompanion.Adapter
     ---@param data table
     ---@return nil
     on_exit = function(self, data)
-      if data.status >= 400 then
+      if data.status and data.status >= 400 then
         log:error("AWS Bedrock Error: %s", data.body)
       end
     end,
@@ -384,7 +404,6 @@ return {
       desc = "AWS profile to use from ~/.aws/credentials. Leave empty to use default profile.",
       default = "", -- Empty string means use default profile
       validate = function(p)
-        -- TODO: Implement validation to check if profile exists in ~/.aws/credentials
         return true, ""
       end,
     },
@@ -399,7 +418,6 @@ return {
         "us-east-1",
         "us-west-2",
         "eu-west-1",
-        -- Add other relevant regions
       },
     },
     model = {
@@ -412,7 +430,6 @@ return {
         "anthropic.claude-3-sonnet-20240229-v1:0",
         "anthropic.claude-3-haiku-20240307-v1:0",
         "amazon.titan-text-express-v1",
-        -- Add other available models
       },
     },
     temperature = {

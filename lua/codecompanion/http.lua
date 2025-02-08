@@ -72,11 +72,13 @@ function Client:request(payload, actions, opts)
       handlers.set_body and handlers.set_body(adapter, payload) or {}
     )
   )
+  self.adapter._body = body
 
   local body_file = Path.new(vim.fn.tempname() .. ".json")
-  body_file:write(vim.split(body, "\n"), "w")
+  body_file:write(body, "w")
 
   log:info("Request body file: %s", body_file.filename)
+  log:debug("Request body:\n%s", body)
 
   local function cleanup(status)
     if vim.tbl_contains({ "ERROR", "INFO" }, config.opts.log_level) and status ~= "error" then
@@ -156,6 +158,11 @@ function Client:request(payload, actions, opts)
       end
       cb(nil, data)
     end)
+  end
+
+  -- Insert the sign_request handler here to update request_opts with AWS auth headers.
+  if adapter.handlers and adapter.handlers.sign_request then
+    request_opts = adapter.handlers.sign_request(adapter, payload, request_opts) or request_opts
   end
 
   local request = "post"
