@@ -3,6 +3,8 @@ if vim.g.loaded_codecompanion then
 end
 vim.g.loaded_codecompanion = true
 
+vim.notify("Welcome to CodeCompanion!", vim.log.levels.INFO)
+
 if vim.fn.has("nvim-0.10.0") == 0 then
   return vim.notify("CodeCompanion.nvim requires Neovim 0.10.0+", vim.log.levels.ERROR)
 end
